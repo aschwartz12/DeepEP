@@ -11,16 +11,24 @@
 
 #include <tuple>
 #include <vector>
+#include <string>
 
 #include "config.hpp"
 #include "event.hpp"
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
 
+#ifdef USE_NIXL
+#include <memory>
+#include <optional>
+#include "nixl.h"
+#endif
+
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
 #endif
 
+#ifndef USE_NIXL
 namespace shared_memory {
 
 union MemHandleInner {
@@ -48,15 +56,44 @@ private:
     bool use_fabric;
 };
 }  // namespace shared_memory
+#endif // !USE_NIXL
 
 namespace deep_ep {
+
+#ifdef USE_NIXL
+struct NixlPeerInfo {
+    void* rdma_buffer_ptr;
+    int* sync_buffer_ptr;
+    uint64_t* barrier_ptr;
+    int device_id;
+    int rank;
+};
+
+struct NixlAgentInfo {
+    NixlAgentInfo(std::shared_ptr<nixlAgent> agent, nixlBackendH* backend, int max_num_ranks)
+        : agent(agent), backend(backend) {
+        wire_up_done.resize(max_num_ranks, false);
+        remote_agent_names.resize(max_num_ranks);
+    }
+
+    std::shared_ptr<nixlAgent> agent;
+    std::string agent_name;
+    std::vector<std::string> remote_agent_names;
+    nixl_opt_args_t extra_params;
+    nixlBackendH* backend;
+    std::vector<bool> wire_up_done;
+};
+#endif // USE_NIXL
 
 struct Buffer {
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
 private:
-    // Low-latency mode buffer
+#ifdef USE_NIXL
+    int buffer_idx = 0;
+#else
     int low_latency_buffer_idx = 0;
+#endif
     bool low_latency_mode = false;
 
     // NVLink Buffer
@@ -64,31 +101,40 @@ private:
     void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
 
-    // NVSHMEM Buffer
+    // RDMA Buffer
     int64_t num_rdma_bytes;
     void* rdma_buffer_ptr = nullptr;
 
+#ifdef USE_NIXL
+    int* mask_buffer_ptr = nullptr;
+    int* sync_buffer_ptr = nullptr;
+    int* sync_count_ptr = nullptr;
+    int* local_barrier_cnt_ptr = nullptr;
+#else
     // Shrink mode buffer
     bool enable_shrink = false;
     int* mask_buffer_ptr = nullptr;
     int* sync_buffer_ptr = nullptr;
+#endif
 
     // Device info and communication
     int device_id;
     int num_device_sms;
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
+
+#ifdef USE_NIXL
+    std::vector<int> remote_ranks;
+    cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
+#else
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
+#endif
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
 
-    // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
-
-    // Whether explicit `destroy()` is required.
     bool explicitly_destroy;
-    // After `destroy()` be called, this flag will be true
     bool destroyed = false;
 
     // Barrier signals
@@ -110,9 +156,46 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
+#ifdef USE_NIXL
+    std::unique_ptr<NixlAgentInfo> nixl_agent_info;
+    std::vector<NixlPeerInfo> nixl_peer_info;
+    NixlPeerInfo my_peer_info;
+    int max_num_ranks;
+    int max_experts_per_rank;
+    deep_ep::gpu_nixl_ctx gpu_ctx;
+    uint64_t* last_barrier_counter = nullptr;
+    uint64_t* local_barrier_counter = nullptr;
+
+    void _nixl_agent_init();
+    void _nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds = {});
+    void _nixl_agents_disconnect(const std::vector<int>& ranks);
+    void _nixl_agents_peer_info_gather(std::vector<int>& ranks);
+    void _nixl_agents_peer_info_cleanup(const std::vector<int>& ranks);
+
+    void _nixl_ep_init(void);
+    void _nixl_ep_memory_views_create(void);
+    void _nixl_ep_memory_views_destroy(void);
+    void _nixl_ep_destroy(void);
+
+    void _ipc_handles_sync(const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles);
+#else
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
+#endif
 
 public:
+#ifdef USE_NIXL
+    Buffer(int rank, bool low_latency_mode, bool explicitly_destroy);
+
+    void init(int num_ranks, int max_experts_per_rank, int64_t num_nvl_bytes, int64_t num_rdma_bytes);
+
+    void update_memory_buffers(int num_ranks, int max_experts_per_rank, int64_t num_nvl_bytes, int64_t num_rdma_bytes);
+
+    void connect_ranks(const std::vector<int>& remote_ranks_list,
+                       const std::optional<std::vector<nixl_blob_t>>& remote_mds = std::nullopt,
+                       const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles = {});
+
+    void disconnect_ranks(const std::vector<int>& remote_ranks_list);
+#else
     Buffer(int rank,
            int num_ranks,
            int64_t num_nvl_bytes,
@@ -121,6 +204,7 @@ public:
            bool explicitly_destroy,
            bool enable_shrink,
            bool use_fabric);
+#endif
 
     ~Buffer() noexcept(false);
 
@@ -138,15 +222,19 @@ public:
 
     pybind11::bytearray get_local_ipc_handle() const;
 
+#ifndef USE_NIXL
     pybind11::bytearray get_local_nvshmem_unique_id() const;
+#endif
 
-    torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
+    torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer = false) const;
 
     torch::Stream get_comm_stream() const;
 
+#ifndef USE_NIXL
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
+#endif
 
     void destroy();
 
@@ -157,6 +245,7 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
+#ifndef USE_NIXL
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -198,6 +287,7 @@ public:
         std::optional<EventHandle>& previous_event,
         bool async,
         bool allocate_on_comm_stream);
+#endif
 
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
@@ -229,7 +319,9 @@ public:
                        const std::optional<torch::Tensor>& cached_gbl_channel_prefix_matrix,
                        const std::optional<torch::Tensor>& cached_recv_gbl_rank_prefix_sum,
                        int expert_alignment,
+#ifndef USE_NIXL
                        int num_worst_tokens,
+#endif
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
@@ -252,6 +344,55 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
+#ifdef USE_NIXL
+    void clean_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
+
+    std::tuple<torch::Tensor,
+               std::optional<torch::Tensor>,
+               torch::Tensor,
+               torch::Tensor,
+               torch::Tensor,
+               std::optional<EventHandle>,
+               std::optional<std::function<void()>>>
+    dispatch(const torch::Tensor& x,
+             const torch::Tensor& topk_idx,
+             const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+             const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
+             int num_max_dispatch_tokens_per_rank,
+             int num_experts,
+             bool use_fp8,
+             bool round_scale,
+             bool use_ue8m0,
+             bool async,
+             bool return_recv_hook);
+
+    std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+    combine(const torch::Tensor& x,
+            const torch::Tensor& topk_idx,
+            const torch::Tensor& topk_weights,
+            const torch::Tensor& src_info,
+            const torch::Tensor& layout_range,
+            const std::optional<torch::Tensor>& combine_wait_recv_cost_stats,
+            int num_max_dispatch_tokens_per_rank,
+            int num_experts,
+            bool use_logfmt,
+            bool zero_copy,
+            bool async,
+            bool return_recv_hook,
+            const std::optional<torch::Tensor>& out = std::nullopt);
+
+    void barrier();
+
+    torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts) const;
+
+    void update_mask_buffer(int rank_to_mask, bool mask);
+
+    void query_mask_buffer(const torch::Tensor& mask_status);
+
+    void clean_mask_buffer();
+
+    std::string get_local_metadata() const;
+#else
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 
     std::tuple<torch::Tensor,
@@ -295,6 +436,7 @@ public:
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
 
     void low_latency_clean_mask_buffer();
+#endif // USE_NIXL
 };
 
 }  // namespace deep_ep

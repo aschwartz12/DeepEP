@@ -1,6 +1,8 @@
 import os
 import torch
 import torch.distributed as dist
+from contextlib import contextmanager
+from datetime import timedelta
 from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
@@ -8,6 +10,8 @@ import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
+
+_NIXL_MODE = hasattr(deep_ep_cpp, 'get_rdma_size_hint')
 
 
 class Buffer:
@@ -186,7 +190,8 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        fn = deep_ep_cpp.get_rdma_size_hint if _NIXL_MODE else deep_ep_cpp.get_low_latency_rdma_size_hint
+        return fn(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     def get_comm_stream(self) -> torch.Stream:
         """
@@ -476,22 +481,39 @@ class Buffer:
                 recv_src_meta, send_rdma_head, send_nvl_head = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
-                x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
-                rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            if _NIXL_MODE:
+                recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
+                    x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
+                    rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
+                    expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            else:
+                recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
+                    x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
+                    rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
+                    expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, \
-                rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
-                recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
-                recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
-                recv_src_meta, send_rdma_head, send_nvl_head, event = self.runtime.internode_dispatch(
-                x, x_scales, topk_idx, topk_weights,
-                num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
-                0, 0, None, None, None, None,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            if _NIXL_MODE:
+                recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, \
+                    rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
+                    recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
+                    recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
+                    recv_src_meta, send_rdma_head, send_nvl_head, event = self.runtime.internode_dispatch(
+                    x, x_scales, topk_idx, topk_weights,
+                    num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
+                    0, 0, None, None, None, None,
+                    expert_alignment, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            else:
+                recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, \
+                    rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, \
+                    recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
+                    recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
+                    recv_src_meta, send_rdma_head, send_nvl_head, event = self.runtime.internode_dispatch(
+                    x, x_scales, topk_idx, topk_weights,
+                    num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
+                    0, 0, None, None, None, None,
+                    expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)
@@ -542,7 +564,8 @@ class Buffer:
             hidden: the hidden dimension of each token.
             num_experts: the number of all experts.
         """
-        self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        (self.runtime.clean_buffer if _NIXL_MODE else self.runtime.clean_low_latency_buffer)(
+            num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
     # noinspection PyTypeChecker
     def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
@@ -599,14 +622,16 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        if not _NIXL_MODE:
+            assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
-            self.runtime.low_latency_dispatch(x, topk_idx,
-                                              cumulative_local_expert_recv_stats,
-                                              dispatch_wait_recv_cost_stats,
-                                              num_max_dispatch_tokens_per_rank, num_experts,
-                                              use_fp8, round_scale, use_ue8m0,
-                                              async_finish, return_recv_hook)
+            (self.runtime.dispatch if _NIXL_MODE else self.runtime.low_latency_dispatch)(
+                x, topk_idx,
+                cumulative_local_expert_recv_stats,
+                dispatch_wait_recv_cost_stats,
+                num_max_dispatch_tokens_per_rank, num_experts,
+                use_fp8, round_scale, use_ue8m0,
+                async_finish, return_recv_hook)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
                              packed_recv_layout_range, cumulative_local_expert_recv_stats)
@@ -653,10 +678,13 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                   combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
-                                                                   num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
+        if not _NIXL_MODE:
+            assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        combined_x, event, hook = \
+            (self.runtime.combine if _NIXL_MODE else self.runtime.low_latency_combine)(
+                x, topk_idx, topk_weights, src_info, layout_range,
+                combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+                num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 
@@ -669,7 +697,7 @@ class Buffer:
             mask: if True, will mask the rank (do not recvfrom/sendto the rank), otherwise will unmask the rank.
 
         """
-        self.runtime.low_latency_update_mask_buffer(rank_to_mask, mask)
+        (self.runtime.update_mask_buffer if _NIXL_MODE else self.runtime.low_latency_update_mask_buffer)(rank_to_mask, mask)
 
     def low_latency_query_mask_buffer(self, mask_status: torch.Tensor):
         """
@@ -679,14 +707,14 @@ class Buffer:
             mask_status: `[num_ranks]` with `torch.int`, the mask status of each rank. `1` means mask and `0` means unmasked.
 
         """
-        self.runtime.low_latency_query_mask_buffer(mask_status)
+        (self.runtime.query_mask_buffer if _NIXL_MODE else self.runtime.low_latency_query_mask_buffer)(mask_status)
 
     def low_latency_clean_mask_buffer(self):
         """
         Clean the mask buffer
 
         """
-        self.runtime.low_latency_clean_mask_buffer()
+        (self.runtime.clean_mask_buffer if _NIXL_MODE else self.runtime.low_latency_clean_mask_buffer)()
 
     def get_next_low_latency_combine_buffer(self, handle: object):
         """
@@ -701,4 +729,248 @@ class Buffer:
                 by yourself.
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+        return (self.runtime.get_next_combine_buffer if _NIXL_MODE else self.runtime.get_next_low_latency_combine_buffer)(
+            num_max_dispatch_tokens_per_rank, hidden, num_experts)
+
+    # =====================================================================
+    # NIXL-specific methods (available when compiled with USE_NIXL)
+    # =====================================================================
+
+    @classmethod
+    def nixl_buffer(cls,
+                    disable_ll_nvlink: bool = False,
+                    explicitly_destroy: bool = False,
+                    rank: int = 0,
+                    low_latency_mode: bool = False,
+                    group: Optional[dist.ProcessGroup] = None,
+                    comm: Optional["mpi4py.MPI.Comm"] = None,  # noqa: F821
+                    tcp_store_group=None) -> "Buffer":
+        """
+        Create a Buffer using the NIXL backend (requires compilation with USE_NIXL).
+        Unlike the NVSHMEM constructor, this creates a lightweight buffer shell
+        that is initialized later via `update_memory_buffers()` and `connect_ranks()`.
+
+        Arguments:
+            disable_ll_nvlink: disable NVLink for low-latency mode (sets UCX_TLS=^cuda_ipc).
+            explicitly_destroy: require explicit `destroy()` call.
+            rank: the rank number.
+            low_latency_mode: enable low-latency mode.
+            group: optional ProcessGroup for collective operations.
+            comm: optional mpi4py communicator.
+            tcp_store_group: optional TCPStore for NIXL metadata exchange.
+
+        Returns:
+            buffer: a new Buffer instance.
+        """
+        assert _NIXL_MODE, "NIXL mode requires compilation with USE_NIXL"
+        instance = cls.__new__(cls)
+        instance.rank = rank
+        instance.group_size = 0
+        instance.low_latency_mode = low_latency_mode
+        instance.explicitly_destroy = explicitly_destroy
+        instance.enable_shrink = False
+        instance.group = group
+        instance.comm = comm
+        instance.tcp_store_group = tcp_store_group
+        instance.num_nvl_bytes = 0
+        instance.num_rdma_bytes = 0
+
+        if disable_ll_nvlink:
+            os.environ["UCX_TLS"] = "^cuda_ipc"
+
+        if group is not None:
+            check_nvlink_connections(group)
+
+        instance.runtime = deep_ep_cpp.Buffer(rank, low_latency_mode, explicitly_destroy)
+        return instance
+
+    def update_memory_buffers(self, num_ranks: int, num_experts_per_rank: int,
+                              num_nvl_bytes: int, num_rdma_bytes: int) -> None:
+        """
+        Allocate memory buffers for NIXL mode. Must be called before `connect_ranks()`.
+
+        Arguments:
+            num_ranks: the number of ranks.
+            num_experts_per_rank: the number of experts per rank.
+            num_nvl_bytes: the buffer size for intranode NVLink communication.
+            num_rdma_bytes: the buffer size for RDMA communication.
+        """
+        assert _NIXL_MODE, "update_memory_buffers requires NIXL mode"
+        self.group_size = num_ranks
+        self.num_nvl_bytes = num_nvl_bytes
+        self.num_rdma_bytes = num_rdma_bytes
+        self.runtime.update_memory_buffers(num_ranks, num_experts_per_rank, num_nvl_bytes, num_rdma_bytes)
+
+    def set_tcp_store_group(self, tcp_store_group) -> None:
+        """
+        Set or update the TCPStore for NIXL metadata exchange.
+        """
+        self.tcp_store_group = tcp_store_group
+
+    @contextmanager
+    def _fetch_remote_metadata_from_tcp_store(self, remote_ranks: List[int]):
+        assert self.tcp_store_group is not None, "TCPStore group is not set"
+        md_key = f"NIXL_EP/{self.rank}"
+        nixl_metadata_bytes = self.runtime.get_local_metadata()
+        self.tcp_store_group.set(md_key, nixl_metadata_bytes)
+
+        remote_md_keys = [f"NIXL_EP/{r}" for r in remote_ranks]
+        if remote_md_keys:
+            self.tcp_store_group.wait(remote_md_keys, timedelta(seconds=300))
+            remote_mds = self.tcp_store_group.multi_get(remote_md_keys)
+        else:
+            remote_mds = []
+
+        try:
+            yield remote_mds
+        finally:
+            self.tcp_store_group.delete_key(md_key)
+
+    def connect_ranks(self, remote_ranks: List[int]) -> None:
+        """
+        Connect to remote ranks (NIXL mode). Exchanges IPC handles via
+        group/comm when available and NIXL metadata via TCPStore, supporting
+        both high-throughput and low-latency modes with a single buffer
+        (mirroring the NVSHMEM approach where IPC handles are always exchanged).
+
+        Arguments:
+            remote_ranks: list of remote rank IDs to connect to.
+        """
+        assert _NIXL_MODE, "connect_ranks requires NIXL mode"
+
+        # Exchange IPC handles when group/comm is available (for HT NVLink internode),
+        # regardless of low_latency_mode — mirrors NVSHMEM which always exchanges them.
+        ipc_handles = None
+        if self.group is not None:
+            def all_gather_object(obj):
+                object_list = [None] * self.group_size
+                dist.all_gather_object(object_list, obj, self.group)
+                return object_list
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            ipc_handles = all_gather_object(local_ipc_handle)
+        elif hasattr(self, 'comm') and self.comm is not None:
+            def all_gather_object(obj):
+                return self.comm.allgather(obj)
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            ipc_handles = all_gather_object(local_ipc_handle)
+
+        # Exchange NIXL metadata and connect
+        if hasattr(self, 'tcp_store_group') and self.tcp_store_group is not None:
+            with self._fetch_remote_metadata_from_tcp_store(remote_ranks) as remote_mds:
+                if ipc_handles is not None:
+                    self.runtime.connect_ranks(remote_ranks, remote_mds, ipc_handles)
+                else:
+                    self.runtime.connect_ranks(remote_ranks, remote_mds)
+        else:
+            if ipc_handles is not None:
+                self.runtime.connect_ranks(remote_ranks, None, ipc_handles)
+            else:
+                self.runtime.connect_ranks(remote_ranks)
+
+    def disconnect_ranks(self, remote_ranks: List[int]) -> None:
+        """
+        Disconnect from remote ranks (NIXL mode).
+
+        Arguments:
+            remote_ranks: list of remote rank IDs to disconnect from.
+        """
+        assert _NIXL_MODE, "disconnect_ranks requires NIXL mode"
+        self.runtime.disconnect_ranks(remote_ranks)
+
+    def barrier(self) -> None:
+        """
+        Barrier across all active ranks (NIXL mode).
+        """
+        assert _NIXL_MODE, "barrier requires NIXL mode"
+        self.runtime.barrier()
+
+    @staticmethod
+    def get_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int,
+                           num_ranks: int, num_experts: int) -> int:
+        """
+        Get a minimum RDMA buffer size requirement (NIXL mode).
+
+        Arguments:
+            num_max_dispatch_tokens_per_rank: maximum tokens to dispatch per rank.
+            hidden: hidden dimension of each token.
+            num_ranks: the number of EP group ranks.
+            num_experts: the number of all experts.
+
+        Returns:
+            size: the RDMA buffer size recommended.
+        """
+        assert _NIXL_MODE, "get_rdma_size_hint requires NIXL mode"
+        return deep_ep_cpp.get_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+
+    def nixl_clean_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
+        """
+        Clean the buffer (NIXL mode equivalent of clean_low_latency_buffer).
+        """
+        assert _NIXL_MODE, "nixl_clean_buffer requires NIXL mode"
+        self.runtime.clean_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+
+    # noinspection PyTypeChecker
+    def nixl_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
+                      num_max_dispatch_tokens_per_rank: int, num_experts: int,
+                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                      dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
+                      use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
+                      async_finish: bool = False, return_recv_hook: bool = False) -> \
+            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
+        """
+        NIXL dispatch implementation. See `low_latency_dispatch` for parameter docs.
+        """
+        assert _NIXL_MODE, "nixl_dispatch requires NIXL mode"
+        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
+            self.runtime.dispatch(x, topk_idx,
+                                  cumulative_local_expert_recv_stats,
+                                  dispatch_wait_recv_cost_stats,
+                                  num_max_dispatch_tokens_per_rank, num_experts,
+                                  use_fp8, round_scale, use_ue8m0,
+                                  async_finish, return_recv_hook)
+        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+        tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count,
+                             packed_recv_src_info, packed_recv_layout_range, cumulative_local_expert_recv_stats)
+        return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
+            EventOverlap(event, tensors_to_record if async_finish else None), hook
+
+    # noinspection PyTypeChecker
+    def nixl_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                     handle: tuple, use_logfmt: bool = False, zero_copy: bool = False,
+                     async_finish: bool = False, return_recv_hook: bool = False,
+                     out: Optional[torch.Tensor] = None,
+                     combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
+            Tuple[torch.Tensor, EventOverlap, Callable]:
+        """
+        NIXL combine implementation. See `low_latency_combine` for parameter docs.
+        """
+        assert _NIXL_MODE, "nixl_combine requires NIXL mode"
+        src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        combined_x, event, hook = self.runtime.combine(x, topk_idx, topk_weights, src_info, layout_range,
+                                                       combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+                                                       num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
+        tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
+        return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
+
+    def nixl_update_mask_buffer(self, rank_to_mask: int, mask: bool = False):
+        """Mask (unmask) a rank (NIXL mode)."""
+        assert _NIXL_MODE, "nixl_update_mask_buffer requires NIXL mode"
+        self.runtime.update_mask_buffer(rank_to_mask, mask)
+
+    def nixl_query_mask_buffer(self, mask_status: torch.Tensor):
+        """Query mask status of all ranks (NIXL mode)."""
+        assert _NIXL_MODE, "nixl_query_mask_buffer requires NIXL mode"
+        self.runtime.query_mask_buffer(mask_status)
+
+    def nixl_clean_mask_buffer(self):
+        """Clean the mask buffer (NIXL mode)."""
+        assert _NIXL_MODE, "nixl_clean_mask_buffer requires NIXL mode"
+        self.runtime.clean_mask_buffer()
+
+    def get_next_combine_buffer(self, handle: object):
+        """
+        Get the raw RDMA buffer for next combine (NIXL mode).
+        """
+        assert _NIXL_MODE, "get_next_combine_buffer requires NIXL mode"
+        src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        return self.runtime.get_next_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
