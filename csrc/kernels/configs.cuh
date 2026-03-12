@@ -17,8 +17,13 @@
 #define NUM_TIMEOUT_CYCLES 20000000000ull  // 20G cycles ~= 10s
 #endif
 
+#ifdef USE_NIXL
+#define EP_SEND_PHASE 1
+#define EP_RECV_PHASE 2
+#else
 #define LOW_LATENCY_SEND_PHASE 1
 #define LOW_LATENCY_RECV_PHASE 2
+#endif
 
 // Make CLion CUDA indexing work
 #ifdef __CLION_IDE__
@@ -80,7 +85,9 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 
 }  // namespace deep_ep
 
-#ifndef DISABLE_NVSHMEM
+#ifdef USE_NIXL
+#include <infiniband/mlx5dv.h>
+#elif !defined(DISABLE_NVSHMEM)
 #include <device_host_transport/nvshmem_common_ibgda.h>
 #include <infiniband/mlx5dv.h>
 #include <nvshmem.h>
