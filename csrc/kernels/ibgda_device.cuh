@@ -171,8 +171,7 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
 
     // Always post, not in batch
     if (!state->use_async_postsend) {
-        constexpr int kNumRequestInBatch = 4;
-        if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
+        if (kAlwaysDoPostSend or (message_idx + 1) % kRdmaFlushInterval == 0)
             ibgda_post_send(qp, new_wqe_idx);
     }
 }
