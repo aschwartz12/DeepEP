@@ -11,16 +11,24 @@
 
 #include <tuple>
 #include <vector>
+#include <string>
 
 #include "config.hpp"
 #include "event.hpp"
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
 
+#ifdef USE_NIXL
+#include <memory>
+#include <optional>
+#include "nixl.h"
+#endif
+
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
 #endif
 
+#ifndef USE_NIXL
 namespace shared_memory {
 
 union MemHandleInner {
@@ -48,37 +56,81 @@ private:
     bool use_fabric;
 };
 }  // namespace shared_memory
+#endif // !USE_NIXL
 
 namespace deep_ep {
+
+#ifdef USE_NIXL
+struct NixlPeerInfo {
+    void* rdma_buffer_ptr;
+    int* sync_buffer_ptr;
+    uint64_t* barrier_ptr;
+    int device_id;
+    int rank;
+};
+
+struct NixlAgentInfo {
+    NixlAgentInfo(std::shared_ptr<nixlAgent> agent, nixlBackendH* backend, int max_num_ranks)
+        : agent(agent), backend(backend) {
+        wire_up_done.resize(max_num_ranks, false);
+        remote_agent_names.resize(max_num_ranks);
+    }
+
+    std::shared_ptr<nixlAgent> agent;
+    std::string agent_name;
+    std::vector<std::string> remote_agent_names;
+    nixl_opt_args_t extra_params;
+    nixlBackendH* backend;
+    std::vector<bool> wire_up_done;
+};
+#endif // USE_NIXL
 
 struct Buffer {
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
 private:
-    // Low-latency mode buffer
     int low_latency_buffer_idx = 0;
     bool low_latency_mode = false;
+
+#ifdef USE_NIXL
+    int get_ll_num_ranks() const { return max_num_ranks; }
+#else
+    int get_ll_num_ranks() const { return num_ranks; }
+#endif
 
     // NVLink Buffer
     int64_t num_nvl_bytes;
     void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
 
-    // NVSHMEM Buffer
+    // RDMA Buffer
     int64_t num_rdma_bytes;
     void* rdma_buffer_ptr = nullptr;
 
+#ifdef USE_NIXL
+    int* mask_buffer_ptr = nullptr;
+    int* sync_buffer_ptr = nullptr;
+    int* sync_count_ptr = nullptr;
+    int* local_barrier_cnt_ptr = nullptr;
+#else
     // Shrink mode buffer
     bool enable_shrink = false;
     int* mask_buffer_ptr = nullptr;
     int* sync_buffer_ptr = nullptr;
+#endif
 
     // Device info and communication
     int device_id;
     int num_device_sms;
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
+
+#ifdef USE_NIXL
+    std::vector<int> remote_ranks;
+    cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
+#else
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
+#endif
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -110,9 +162,46 @@ private:
     volatile int* moe_recv_rdma_counter = nullptr;
     int* moe_recv_rdma_counter_mapped = nullptr;
 
+#ifdef USE_NIXL
+    std::unique_ptr<NixlAgentInfo> nixl_agent_info;
+    std::vector<NixlPeerInfo> nixl_peer_info;
+    NixlPeerInfo my_peer_info;
+    int max_num_ranks;
+    int max_experts_per_rank;
+    deep_ep::gpu_nixl_ctx gpu_ctx;
+    uint64_t* last_barrier_counter = nullptr;
+    uint64_t* local_barrier_counter = nullptr;
+
+    void _nixl_agent_init();
+    void _nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds = {});
+    void _nixl_agents_disconnect(const std::vector<int>& ranks);
+    void _nixl_agents_peer_info_gather(std::vector<int>& ranks);
+    void _nixl_agents_peer_info_cleanup(const std::vector<int>& ranks);
+
+    void _nixl_ep_init(void);
+    void _nixl_ep_memory_views_create(void);
+    void _nixl_ep_memory_views_destroy(void);
+    void _nixl_ep_destroy(void);
+#else
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
+#endif
+
+    void _ipc_handles_sync(const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles);
 
 public:
+#ifdef USE_NIXL
+    Buffer(int rank, bool low_latency_mode, bool explicitly_destroy);
+
+    void init(int num_ranks, int max_experts_per_rank, int64_t num_nvl_bytes, int64_t num_rdma_bytes);
+
+    void update_memory_buffers(int num_ranks, int max_experts_per_rank, int64_t num_nvl_bytes, int64_t num_rdma_bytes);
+
+    void connect_ranks(const std::vector<int>& remote_ranks_list,
+                       const std::optional<std::vector<nixl_blob_t>>& remote_mds = std::nullopt,
+                       const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles = {});
+
+    void disconnect_ranks(const std::vector<int>& remote_ranks_list);
+#else
     Buffer(int rank,
            int num_ranks,
            int64_t num_nvl_bytes,
@@ -121,6 +210,7 @@ public:
            bool explicitly_destroy,
            bool enable_shrink,
            bool use_fabric);
+#endif
 
     ~Buffer() noexcept(false);
 
@@ -138,15 +228,19 @@ public:
 
     pybind11::bytearray get_local_ipc_handle() const;
 
+#ifndef USE_NIXL
     pybind11::bytearray get_local_nvshmem_unique_id() const;
+#endif
 
-    torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
+    torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer = false) const;
 
     torch::Stream get_comm_stream() const;
 
+#ifndef USE_NIXL
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
+#endif
 
     void destroy();
 
@@ -157,6 +251,7 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
+#ifndef USE_NIXL
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -198,6 +293,7 @@ public:
         std::optional<EventHandle>& previous_event,
         bool async,
         bool allocate_on_comm_stream);
+#endif
 
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
@@ -295,6 +391,11 @@ public:
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
 
     void low_latency_clean_mask_buffer();
+
+#ifdef USE_NIXL
+    void barrier();
+    std::string get_local_metadata() const;
+#endif // USE_NIXL
 };
 
 }  // namespace deep_ep

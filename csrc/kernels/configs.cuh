@@ -78,9 +78,13 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 #undef INT_BITS_T
 #undef INT_BITS_T2
 
+constexpr int kRdmaFlushInterval = 4;
+
 }  // namespace deep_ep
 
-#ifndef DISABLE_NVSHMEM
+#ifdef USE_NIXL
+#include <infiniband/mlx5dv.h>
+#elif !defined(DISABLE_NVSHMEM)
 #include <device_host_transport/nvshmem_common_ibgda.h>
 #include <infiniband/mlx5dv.h>
 #include <nvshmem.h>
