@@ -4,15 +4,28 @@
 #include "buffer.cuh"
 #include "configs.cuh"
 #include "exception.cuh"
-#include "ibgda_device.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
+#include "api.cuh"
+
+#include "nixl_util.cuh"
+
+#ifdef USE_NIXL
+#include "nixl_device.cuh"
+#else
+#include "ibgda_device.cuh"
+#endif
 
 namespace deep_ep {
 
 namespace internode {
 
+#ifdef USE_NIXL
+#define NVSHMEM_TEAM_TRAILING_ARG
+#else
 extern nvshmem_team_t cpu_rdma_team;
+#define NVSHMEM_TEAM_TRAILING_ARG , cpu_rdma_team
+#endif
 
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
@@ -84,10 +97,12 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
     return kLowLatencyMode ? (dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank) : dst_rdma_rank;
 }
 
+#ifndef USE_NIXL
 template <bool kLowLatencyMode>
 __forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const nvshmem_team_t& rdma_team) {
     kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
 }
+#endif
 
 template <bool kLowLatencyMode, int kNumRDMARanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
@@ -115,7 +130,11 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 void** buffer_ptrs,
                                 int** barrier_signal_ptrs,
                                 int rank,
+#ifdef USE_NIXL
+                                gpu_nixl_ctx nixl_ctx) {
+#else
                                 const nvshmem_team_t rdma_team) {
+#endif
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
@@ -129,6 +148,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
 
+#ifndef USE_NIXL
         // waiting for all previous inflight wrs to complete,
         // in case of rewriting cleared rdma_buffer
         auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
@@ -138,9 +158,15 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id);
         }
         __syncthreads();
+#endif
 
+#ifdef USE_NIXL
+        if (warp_id == 1)
+            nixl_util::internode_sync_warp<kLowLatencyMode>(nixl_ctx, lane_id, num_channels, rank, kNumRDMARanks);
+#else
         if (thread_id == 32)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+#endif
         barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
 
         // Send numbers of tokens per rank/expert to RDMA ranks
@@ -170,6 +196,17 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // TODO: overlap EP barrier and NVL cleaning
         for (int i = warp_id; i < kNumRDMARanks; i += num_warps) {
             if (i != rdma_rank) {
+#ifdef USE_NIXL
+                int dst = translate_dst_rdma_rank<true>(i, nvl_rank);
+                auto src_ptr_ = reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.send_buffer(i));
+                auto dst_ptr_ = reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank));
+                nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, (src_ptr_ - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst),
+                    (dst_ptr_ - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(
+                    src_mdesc, dst_mdesc, (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int),
+                    0, 0) == NIXL_IN_PROG);
+#else
                 nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank)),
                                                   reinterpret_cast<uint64_t>(rdma_recv_num_tokens_mixed.send_buffer(i)),
                                                   (NUM_MAX_NVL_PEERS + num_rdma_experts + 1) * sizeof(int),
@@ -177,6 +214,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                                   0,
                                                   lane_id,
                                                   0);
+#endif
             } else {
                 UNROLLED_WARP_COPY(1,
                                    lane_id,
@@ -189,14 +227,23 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         }
         __syncthreads();
 
-        // Wait previous operations to be finished
+        // Wait previous operations to be finished.
+        // NIXL does not need an explicit quiet -- nixlPut/nixlAtomicAdd with fence semantics
+        // provide ordering, and the internode_sync_warp barrier below ensures completion.
+#ifndef USE_NIXL
         if (thread_id < kNumRDMARanks and thread_id != rdma_rank)
             nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank), 0);
+#endif
         __syncthreads();
 
         // Barrier
+#ifdef USE_NIXL
+        if (warp_id == 0)
+            nixl_util::internode_sync_warp<kLowLatencyMode>(nixl_ctx, lane_id, num_channels, rank, kNumRDMARanks);
+#else
         if (thread_id == 0)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+#endif
         __syncthreads();
 
         // NVL buffers
@@ -286,8 +333,13 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         }
 
         // Finally barrier
+#ifdef USE_NIXL
+        if (warp_id == 1)
+            nixl_util::internode_sync_warp<kLowLatencyMode>(nixl_ctx, lane_id, num_channels, rank, kNumRDMARanks);
+#else
         if (thread_id == 32)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+#endif
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
     } else {
         // Calculate meta data
@@ -372,7 +424,9 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
-                     bool low_latency_mode) {
+                     bool low_latency_mode
+                     NIXL_CTX_TRAILING_PARAM) {
+
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                    \
     {                                                                                                                                  \
         auto notify_dispatch_func = low_latency_mode ? notify_dispatch<true, num_rdma_ranks> : notify_dispatch<false, num_rdma_ranks>; \
@@ -402,8 +456,9 @@ void notify_dispatch(const int* num_tokens_per_rank,
                       rdma_buffer_ptr,                                                                                                 \
                       buffer_ptrs,                                                                                                     \
                       barrier_signal_ptrs,                                                                                             \
-                      rank,                                                                                                            \
-                      cpu_rdma_team);                                                                                                  \
+                      rank                                                                                                             \
+                      NIXL_CTX_TRAILING_ARG                                                                                            \
+                      NVSHMEM_TEAM_TRAILING_ARG);                                                                                      \
     }                                                                                                                                  \
     break
 
@@ -478,7 +533,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int num_max_nvl_chunked_send_tokens,
              int num_max_nvl_chunked_recv_tokens,
              int rank,
-             int num_ranks) {
+             int num_ranks
+             NIXL_CTX_TRAILING_PARAM) {
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -489,7 +545,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
 
+#ifndef USE_NIXL
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
+#endif
 
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
         if (is_forwarder) {
@@ -609,6 +667,17 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
             // Issue RDMA for non-local ranks
             if (dst_rdma_rank != rdma_rank) {
+#ifdef USE_NIXL
+                int dst = translate_dst_rdma_rank<true>(dst_rdma_rank, nvl_rank);
+                auto src_ptr_ = reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank));
+                auto dst_ptr_ = reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank));
+                nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, (src_ptr_ - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst),
+                    (dst_ptr_ - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(
+                    src_mdesc, dst_mdesc, sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
+                    channel_id, 0) == NIXL_IN_PROG);
+#else
                 nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank)),
                                                   reinterpret_cast<uint64_t>(rdma_channel_meta.send_buffer(dst_rdma_rank)),
                                                   sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
@@ -616,6 +685,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                                                   channel_id,
                                                   lane_id,
                                                   0);
+#endif
             }
         }
         sync_rdma_sender_smem();
@@ -815,6 +885,17 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_token);
                     const auto src_ptr =
                         reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_token);
+#ifdef USE_NIXL
+                    {
+                        int dst = translate_dst_rdma_rank<true>(dst_rdma_rank, nvl_rank);
+                        nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, (src_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                        nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst),
+                            (dst_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                        EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(
+                            src_mdesc, dst_mdesc, num_bytes_per_msg,
+                            channel_id, 0) == NIXL_IN_PROG);
+                    }
+#else
                     nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr,
                                                       src_ptr,
                                                       num_bytes_per_msg,
@@ -822,6 +903,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                                                       channel_id,
                                                       lane_id,
                                                       0);
+#endif
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
@@ -832,11 +914,24 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
+#ifdef USE_NIXL
+                    if (dst_rdma_rank == rdma_rank) {
+                        atomicAdd(reinterpret_cast<unsigned long long*>(rdma_channel_tail.buffer(rdma_rank)),
+                                  static_cast<unsigned long long>(num_tokens_to_issue));
+                    } else {
+                        int dst = translate_dst_rdma_rank<true>(dst_rdma_rank, nvl_rank);
+                        auto tail_ptr = reinterpret_cast<uint64_t>(rdma_channel_tail.buffer(rdma_rank));
+                        nixlMemViewElem mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst), (tail_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                        EP_DEVICE_ASSERT(nixlAtomicAdd<nixl_gpu_level_t::THREAD>(
+                            static_cast<uint64_t>(num_tokens_to_issue), mdesc, channel_id, 0) == NIXL_IN_PROG);
+                    }
+#else
                     nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
                                                     num_tokens_to_issue,
                                                     translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                     channel_id,
                                                     dst_rdma_rank == rdma_rank);
+#endif
                 }
                 __syncwarp();
             }
@@ -1042,11 +1137,24 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             // Update remote head
             if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and
                 lane_id < kNumRDMARanks) {
+#ifdef USE_NIXL
+                if (lane_id == rdma_rank) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(rdma_channel_head.buffer(rdma_rank)),
+                              static_cast<unsigned long long>(min_head - last_head));
+                } else {
+                    int dst = translate_dst_rdma_rank<true>(lane_id, nvl_rank);
+                    auto head_ptr = reinterpret_cast<uint64_t>(rdma_channel_head.buffer(rdma_rank));
+                    nixlMemViewElem mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst), (head_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                    EP_DEVICE_ASSERT(nixlAtomicAdd<nixl_gpu_level_t::THREAD>(
+                        static_cast<uint64_t>(min_head - last_head), mdesc, channel_id + num_channels, 0) == NIXL_IN_PROG);
+                }
+#else
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
                                                 min_head - last_head,
                                                 translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank),
                                                 channel_id + num_channels,
                                                 lane_id == rdma_rank);
+#endif
                 last_head = min_head;
             }
 
@@ -1244,7 +1352,8 @@ void dispatch(void* recv_x,
               bool is_cached_dispatch,
               cudaStream_t stream,
               int num_channels,
-              bool low_latency_mode) {
+              bool low_latency_mode
+              NIXL_CTX_TRAILING_PARAM) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
     constexpr int kNumTMABytesPerWarp = 16384;
     constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
@@ -1295,7 +1404,8 @@ void dispatch(void* recv_x,
                       num_max_nvl_chunked_send_tokens,                                                                         \
                       num_max_nvl_chunked_recv_tokens,                                                                         \
                       rank,                                                                                                    \
-                      num_ranks);                                                                                              \
+                      num_ranks                                                                                                \
+                      NIXL_CTX_TRAILING_ARG);                                                                                  \
     }                                                                                                                          \
     break
 
@@ -1324,7 +1434,11 @@ __global__ void cached_notify(const int rdma_clean_offset,
                               int rank,
                               int num_ranks,
                               bool is_cached_dispatch,
+#ifdef USE_NIXL
+                              gpu_nixl_ctx nixl_ctx) {
+#else
                               const nvshmem_team_t rdma_team) {
+#endif
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto num_threads = static_cast<int>(blockDim.x);
@@ -1338,6 +1452,7 @@ __global__ void cached_notify(const int rdma_clean_offset,
 
     // Using two SMs, which clean the RDMA/NVL buffer respectively
     if (sm_id == 0) {
+#ifndef USE_NIXL
         auto qps_per_rdma_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
         for (int i = thread_id; i < qps_per_rdma_rank * (num_rdma_ranks - 1); i += num_threads) {
             auto dst_rdma_rank = (i / qps_per_rdma_rank + rdma_rank + 1) % num_rdma_ranks;
@@ -1345,10 +1460,16 @@ __global__ void cached_notify(const int rdma_clean_offset,
             nvshmemi_ibgda_quiet(translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank), qp_id);
         }
         __syncthreads();
+#endif
 
         // Barrier for RDMA
+#ifdef USE_NIXL
+        if (warp_id == 1)
+            nixl_util::internode_sync_warp<kLowLatencyMode>(nixl_ctx, lane_id, num_channels, rank, num_rdma_ranks);
+#else
         if (thread_id == 32)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+#endif
 
         // Barrier for NVL
         barrier_block<NUM_MAX_NVL_PEERS, true>(barrier_signal_ptrs, nvl_rank);
@@ -1367,8 +1488,13 @@ __global__ void cached_notify(const int rdma_clean_offset,
         __syncthreads();
 
         // Barrier again
+#ifdef USE_NIXL
+        if (warp_id == 1)
+            nixl_util::internode_sync_warp<kLowLatencyMode>(nixl_ctx, lane_id, num_channels, rank, num_rdma_ranks);
+#else
         if (thread_id == 32)
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+#endif
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
     } else if (sm_id == 1) {
         if (is_cached_dispatch)
@@ -1488,7 +1614,8 @@ void cached_notify(int hidden_int4,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
-                   bool low_latency_mode) {
+                   bool low_latency_mode
+                   NIXL_CTX_TRAILING_PARAM) {
     const int num_threads = std::max(128, 32 * num_channels);
     const int num_warps = num_threads / 32;
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
@@ -1534,8 +1661,9 @@ void cached_notify(int hidden_int4,
                   barrier_signal_ptrs,
                   rank,
                   num_ranks,
-                  is_cached_dispatch,
-                  cpu_rdma_team);
+                  is_cached_dispatch
+                  NIXL_CTX_TRAILING_ARG
+                  NVSHMEM_TEAM_TRAILING_ARG);
 }
 
 template <int kNumRanks,
@@ -1737,7 +1865,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                                                                         int num_max_nvl_chunked_send_tokens,
                                                                         int num_max_nvl_chunked_recv_tokens,
                                                                         int rank,
-                                                                        int num_ranks) {
+                                                                        int num_ranks
+                                                                        NIXL_CTX_TRAILING_PARAM) {
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
 
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -2115,6 +2244,18 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                             reinterpret_cast<uint64_t>(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_token);
                         const auto src_ptr =
                             reinterpret_cast<uint64_t>(rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_token);
+#ifdef USE_NIXL
+                        {
+                            int dst = translate_dst_rdma_rank<true>(dst_rdma_rank, nvl_rank);
+                            nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0,
+                                (src_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                            nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst),
+                                (dst_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                            EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(
+                                src_mdesc, dst_mdesc, num_bytes_per_msg,
+                                channel_id, 0) == NIXL_IN_PROG);
+                        }
+#else
                         nvshmemi_ibgda_put_nbi_warp<true>(dst_ptr,
                                                           src_ptr,
                                                           num_bytes_per_msg,
@@ -2122,6 +2263,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                                                           channel_id,
                                                           lane_id,
                                                           0);
+#endif
                     } else {
                         memory_fence();
                     }
@@ -2129,11 +2271,24 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                     // Write new RDMA tail
                     __syncwarp();
                     if (elect_one_sync()) {
+#ifdef USE_NIXL
+                        if (dst_rdma_rank == rdma_rank) {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(rdma_channel_tail.buffer(rdma_rank)),
+                                      static_cast<unsigned long long>(num_chunked_tokens));
+                        } else {
+                            int dst = translate_dst_rdma_rank<true>(dst_rdma_rank, nvl_rank);
+                            auto tail_ptr = reinterpret_cast<uint64_t>(rdma_channel_tail.buffer(rdma_rank));
+                            nixlMemViewElem mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst), (tail_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                            EP_DEVICE_ASSERT(nixlAtomicAdd<nixl_gpu_level_t::THREAD>(
+                                static_cast<uint64_t>(num_chunked_tokens), mdesc, channel_id, 0) == NIXL_IN_PROG);
+                        }
+#else
                         nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_tail.buffer(rdma_rank),
                                                         num_chunked_tokens,
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                         channel_id,
                                                         dst_rdma_rank == rdma_rank);
+#endif
                     }
                 }
             }
@@ -2247,11 +2402,24 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                             min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
                     if (min_head != std::numeric_limits<int>::max() and min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
                         lane_id < kNumRDMARanks) {
+#ifdef USE_NIXL
+                        if (dst_rdma_rank == rdma_rank) {
+                            atomicAdd(reinterpret_cast<unsigned long long*>(rdma_channel_head.buffer(rdma_rank)),
+                                      static_cast<unsigned long long>(min_head - last_rdma_head));
+                        } else {
+                            int dst = translate_dst_rdma_rank<true>(dst_rdma_rank, nvl_rank);
+                            auto head_ptr = reinterpret_cast<uint64_t>(rdma_channel_head.buffer(rdma_rank));
+                            nixlMemViewElem mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst), (head_ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr))};
+                            EP_DEVICE_ASSERT(nixlAtomicAdd<nixl_gpu_level_t::THREAD>(
+                                static_cast<uint64_t>(min_head - last_rdma_head), mdesc, channel_id + num_channels, 0) == NIXL_IN_PROG);
+                        }
+#else
                         nvshmemi_ibgda_amo_nonfetch_add(rdma_channel_head.buffer(rdma_rank),
                                                         min_head - last_rdma_head,
                                                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
                                                         channel_id + num_channels,
                                                         dst_rdma_rank == rdma_rank);
+#endif
                         last_rdma_head = min_head;
                     }
                 } else {
@@ -2303,7 +2471,8 @@ void combine(cudaDataType_t type,
              int num_ranks,
              cudaStream_t stream,
              int num_channels,
-             bool low_latency_mode) {
+             bool low_latency_mode
+             NIXL_CTX_TRAILING_PARAM) {
     constexpr int kNumCombineForwarderWarps = 24;
     constexpr int kNumTMABytesPerSenderWarp = 16384;
     constexpr int kNumTMABytesPerForwarderWarp = 9248;
@@ -2351,7 +2520,8 @@ void combine(cudaDataType_t type,
                       num_max_nvl_chunked_send_tokens,                                \
                       num_max_nvl_chunked_recv_tokens,                                \
                       rank,                                                           \
-                      num_ranks);                                                     \
+                      num_ranks                                                       \
+                      NIXL_CTX_TRAILING_ARG);                                         \
     }                                                                                 \
     break
 

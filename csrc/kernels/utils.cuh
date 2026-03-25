@@ -85,6 +85,10 @@ __device__ __forceinline__ void st_release_sys_global(const int* ptr, int val) {
     asm volatile("st.release.sys.global.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
 }
 
+__device__ __forceinline__ void st_release_sys_global(const uint64_t* ptr, uint64_t val) {
+    asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(ptr), "l"(val) : "memory");
+}
+
 __device__ __forceinline__ void st_release_cta(const int* ptr, int val) {
     asm volatile("st.release.cta.s32 [%0], %1;" ::"l"(ptr), "r"(val) : "memory");
 }
@@ -501,6 +505,17 @@ __forceinline__ __device__ out_dtype_t extract_required_scale_format(float value
     }
 }
 
+#ifdef DISABLE_NVSHMEM
+// Fallback for when NVSHMEM is not available (e.g., USE_NIXL path).
+// System-scope atomics for intranode barrier - use standard CUDA atomics.
+__device__ __forceinline__ void atomicAdd_system(int* addr, int val) {
+    atomicAdd(addr, val);
+}
+__device__ __forceinline__ void atomicSub_system(int* addr, int val) {
+    atomicAdd(addr, -val);
+}
+#endif
+
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
     auto thread_id = static_cast<int>(threadIdx.x);
@@ -635,6 +650,18 @@ __forceinline__ __device__ T warp_reduce_and(T value) {
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
 __forceinline__ __device__ T warp_reduce_or(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceOr<T>{});
+}
+
+template <bool use_warp_sync = false>
+__forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
+    if (mask_buffer_ptr == nullptr) {
+        return false;
+    }
+    if constexpr (use_warp_sync) {
+        return __shfl_sync(0xffffffff, ld_acquire_global(mask_buffer_ptr + rank), 0) != 0;
+    } else {
+        return ld_acquire_global(mask_buffer_ptr + rank) != 0;
+    }
 }
 
 }  // namespace deep_ep

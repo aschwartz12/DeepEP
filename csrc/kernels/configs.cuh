@@ -78,9 +78,13 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 #undef INT_BITS_T
 #undef INT_BITS_T2
 
+constexpr int kRdmaFlushInterval = 4;
+
 }  // namespace deep_ep
 
-#ifndef DISABLE_NVSHMEM
+#ifdef USE_NIXL
+#include <nixl_types.h>
+#elif !defined(DISABLE_NVSHMEM)
 #include <device_host_transport/nvshmem_common_ibgda.h>
 #include <infiniband/mlx5dv.h>
 #include <nvshmem.h>
@@ -88,3 +92,32 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 
 #include <non_abi/device/threadgroup/nvshmemi_common_device_defines.cuh>
 #endif
+
+namespace deep_ep {
+
+#ifdef USE_NIXL
+
+struct gpu_nixl_ctx {
+    // Memory view handle for the local RDMA buffer (self-referencing, used as source for nixlPut)
+    nixlMemViewH local_mvh;
+    // Memory view handle for low-latency peer-to-peer barrier exchanges
+    nixlMemViewH barrier_mvh;
+    // Memory view handle for remote RDMA buffers (used as destination for nixlPut / nixlAtomicAdd)
+    nixlMemViewH remote_mvh;
+    // Memory view handle for internode (cross-RDMA-rank) barrier atomic counters
+    nixlMemViewH internode_barrier_mvh;
+    // Per-rank buffer for low-latency barrier synchronization (decremented on arrival)
+    int *sync_buffer_ptr;
+    // Per-rank counter tracking expected barrier arrivals
+    int *sync_count_ptr;
+    // Base pointer of the local RDMA-registered buffer (used to compute offsets for nixlMemViewElem)
+    void *rdma_buffer_ptr;
+    // Tracks the last completed internode barrier epoch (monotonically increasing)
+    uint64_t *last_barrier_counter;
+    // Local counter incremented by remote atomic adds to signal barrier arrival
+    uint64_t *local_barrier_counter_ptr;
+};
+
+#endif  // USE_NIXL
+
+}  // namespace deep_ep

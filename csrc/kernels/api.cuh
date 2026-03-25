@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "configs.cuh"
+#include "nixl_util.cuh"
 
 namespace deep_ep {
 
@@ -13,7 +14,8 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t st
 
 }  // namespace intranode
 
-// Internode runtime
+#ifndef USE_NIXL
+// Internode runtime (NVSHMEM only)
 namespace internode {
 
 std::vector<uint8_t> get_unique_id();
@@ -29,6 +31,7 @@ void barrier();
 void finalize();
 
 }  // namespace internode
+#endif
 
 // Layout kernels
 namespace layout {
@@ -173,7 +176,8 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
-                     bool low_latency_mode);
+                     bool low_latency_mode
+                     NIXL_CTX_TRAILING_PARAM);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
@@ -212,7 +216,8 @@ void dispatch(void* recv_x,
               bool is_cached_dispatch,
               cudaStream_t stream,
               int num_channels,
-              bool low_latency_mode);
+              bool low_latency_mode
+              NIXL_CTX_TRAILING_PARAM);
 
 void cached_notify(int hidden_int4,
                    int num_scales,
@@ -235,7 +240,8 @@ void cached_notify(int hidden_int4,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
-                   bool low_latency_mode);
+                   bool low_latency_mode
+                   NIXL_CTX_TRAILING_PARAM);
 
 void combine(cudaDataType_t type,
              void* combined_x,
@@ -265,21 +271,26 @@ void combine(cudaDataType_t type,
              int num_ranks,
              cudaStream_t stream,
              int num_channels,
-             bool low_latency_mode);
+             bool low_latency_mode
+             NIXL_CTX_TRAILING_PARAM);
 
 }  // namespace internode
 
 // Internode low-latency kernels
 namespace internode_ll {
 
-void clean_low_latency_buffer(int* clean_0,
+void clean_low_latency_buffer(void* clean_0,
                               int num_clean_int_0,
-                              int* clean_1,
+                              void* clean_1,
                               int num_clean_int_1,
                               int rank,
                               int num_ranks,
                               int* mask_buffer,
+#ifdef USE_NIXL
+                              gpu_nixl_ctx nixl_ctx,
+#else
                               int* sync_buffer,
+#endif
                               cudaStream_t stream);
 
 void dispatch(void* packed_recv_x,
@@ -291,11 +302,20 @@ void dispatch(void* packed_recv_x,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
               void* rdma_recv_x,
+
+#ifdef USE_NIXL
+              uint64_t* rdma_recv_count,
+#else
               int* rdma_recv_count,
+#endif
               void* rdma_x,
               const void* x,
               const topk_idx_t* topk_idx,
+#ifdef USE_NIXL
+              uint64_t* next_clean,
+#else
               int* next_clean,
+#endif
               int num_next_clean_int,
               int num_tokens,
               int hidden,
@@ -310,11 +330,17 @@ void dispatch(void* packed_recv_x,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases);
+              int phases
+              NIXL_CTX_TRAILING_PARAM);
 
 void combine(void* combined_x,
              void* rdma_recv_x,
+
+#ifdef USE_NIXL
+             uint64_t* rdma_recv_flag,
+#else
              int* rdma_recv_flag,
+#endif
              void* rdma_send_x,
              const void* x,
              const topk_idx_t* topk_idx,
@@ -323,7 +349,12 @@ void combine(void* combined_x,
              const int64_t* layout_range,
              int* mask_buffer,
              int64_t* combine_wait_recv_cost_stats,
+
+#ifdef USE_NIXL
+             uint64_t* next_clean,
+#else
              int* next_clean,
+#endif
              int num_next_clean_int,
              int num_combined_tokens,
              int hidden,
@@ -337,7 +368,12 @@ void combine(void* combined_x,
              int num_device_sms,
              cudaStream_t stream,
              int phases,
-             bool zero_copy);
+             bool zero_copy
+             NIXL_CTX_TRAILING_PARAM);
+
+#ifdef USE_NIXL
+void barrier(gpu_nixl_ctx nixl_ctx, int* mask_buffer_ptr, int rank, int num_ranks, cudaStream_t stream);
+#endif
 
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 

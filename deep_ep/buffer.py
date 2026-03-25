@@ -1,6 +1,8 @@
 import os
 import torch
 import torch.distributed as dist
+from contextlib import contextmanager
+from datetime import timedelta
 from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
@@ -8,6 +10,8 @@ import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
+
+_NIXL_MODE = deep_ep_cpp.NIXL_MODE
 
 
 class Buffer:
@@ -599,7 +603,8 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        if not _NIXL_MODE:
+            assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
@@ -653,7 +658,8 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        if not _NIXL_MODE:
+            assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                                    combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
                                                                    num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
@@ -702,3 +708,157 @@ class Buffer:
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+
+    # =====================================================================
+    # NIXL lifecycle/connection methods (available when compiled with USE_NIXL)
+    # For dispatch, combine, mask, and buffer operations, use the
+    # low_latency_* methods above — they handle both NIXL and NVSHMEM modes.
+    # =====================================================================
+
+    @classmethod
+    def nixl_buffer(cls,
+                    disable_ll_nvlink: bool = False,
+                    explicitly_destroy: bool = False,
+                    rank: int = 0,
+                    low_latency_mode: bool = False,
+                    group: Optional[dist.ProcessGroup] = None,
+                    comm: Optional["mpi4py.MPI.Comm"] = None,  # noqa: F821
+                    tcp_store_group=None) -> "Buffer":
+        """
+        Create a Buffer using the NIXL backend (requires compilation with USE_NIXL).
+        Unlike the NVSHMEM constructor, this creates a lightweight buffer shell
+        that is initialized later via `update_memory_buffers()` and `connect_ranks()`.
+
+        Arguments:
+            disable_ll_nvlink: disable NVLink for low-latency mode (sets UCX_TLS=^cuda_ipc).
+            explicitly_destroy: require explicit `destroy()` call.
+            rank: the rank number.
+            low_latency_mode: enable low-latency mode.
+            group: optional ProcessGroup for collective operations.
+            comm: optional mpi4py communicator.
+            tcp_store_group: optional TCPStore for NIXL metadata exchange.
+
+        Returns:
+            buffer: a new Buffer instance.
+        """
+        assert _NIXL_MODE, "NIXL mode requires compilation with USE_NIXL"
+        instance = cls.__new__(cls)
+        instance.rank = rank
+        instance.group_size = 0
+        instance.low_latency_mode = low_latency_mode
+        instance.explicitly_destroy = explicitly_destroy
+        instance.enable_shrink = False
+        instance.group = group
+        instance.comm = comm
+        instance.tcp_store_group = tcp_store_group
+        instance.num_nvl_bytes = 0
+        instance.num_rdma_bytes = 0
+
+        if disable_ll_nvlink:
+            os.environ["UCX_TLS"] = "^cuda_ipc"
+
+        if group is not None:
+            check_nvlink_connections(group)
+
+        instance.runtime = deep_ep_cpp.Buffer(rank, low_latency_mode, explicitly_destroy)
+        return instance
+
+    def update_memory_buffers(self, num_ranks: int, num_experts_per_rank: int,
+                              num_nvl_bytes: int, num_rdma_bytes: int) -> None:
+        """
+        Allocate memory buffers for NIXL mode. Must be called before `connect_ranks()`.
+
+        Arguments:
+            num_ranks: the number of ranks.
+            num_experts_per_rank: the number of experts per rank.
+            num_nvl_bytes: the buffer size for intranode NVLink communication.
+            num_rdma_bytes: the buffer size for RDMA communication.
+        """
+        assert _NIXL_MODE, "update_memory_buffers requires NIXL mode"
+        self.group_size = num_ranks
+        self.num_nvl_bytes = num_nvl_bytes
+        self.num_rdma_bytes = num_rdma_bytes
+        self.runtime.update_memory_buffers(num_ranks, num_experts_per_rank, num_nvl_bytes, num_rdma_bytes)
+
+    def set_tcp_store_group(self, tcp_store_group) -> None:
+        """
+        Set or update the TCPStore for NIXL metadata exchange.
+        """
+        self.tcp_store_group = tcp_store_group
+
+    @contextmanager
+    def _fetch_remote_metadata_from_tcp_store(self, remote_ranks: List[int]):
+        assert self.tcp_store_group is not None, "TCPStore group is not set"
+        md_key = f"NIXL_EP/{self.rank}"
+        nixl_metadata_bytes = self.runtime.get_local_metadata()
+        self.tcp_store_group.set(md_key, nixl_metadata_bytes)
+
+        remote_md_keys = [f"NIXL_EP/{r}" for r in remote_ranks]
+        if remote_md_keys:
+            self.tcp_store_group.wait(remote_md_keys, timedelta(seconds=300))
+            remote_mds = self.tcp_store_group.multi_get(remote_md_keys)
+        else:
+            remote_mds = []
+
+        try:
+            yield remote_mds
+        finally:
+            self.tcp_store_group.delete_key(md_key)
+
+    def connect_ranks(self, remote_ranks: List[int]) -> None:
+        """
+        Connect to remote ranks (NIXL mode). Exchanges IPC handles via
+        group/comm when available and NIXL metadata via TCPStore, supporting
+        both high-throughput and low-latency modes with a single buffer
+        (mirroring the NVSHMEM approach where IPC handles are always exchanged).
+
+        Arguments:
+            remote_ranks: list of remote rank IDs to connect to.
+        """
+        assert _NIXL_MODE, "connect_ranks requires NIXL mode"
+
+        # Exchange IPC handles when group/comm is available (for HT NVLink internode),
+        # regardless of low_latency_mode — mirrors NVSHMEM which always exchanges them.
+        ipc_handles = None
+        if self.group is not None:
+            def all_gather_object(obj):
+                object_list = [None] * self.group_size
+                dist.all_gather_object(object_list, obj, self.group)
+                return object_list
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            ipc_handles = all_gather_object(local_ipc_handle)
+        elif hasattr(self, 'comm') and self.comm is not None:
+            def all_gather_object(obj):
+                return self.comm.allgather(obj)
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            ipc_handles = all_gather_object(local_ipc_handle)
+
+        # Exchange NIXL metadata and connect
+        if hasattr(self, 'tcp_store_group') and self.tcp_store_group is not None:
+            with self._fetch_remote_metadata_from_tcp_store(remote_ranks) as remote_mds:
+                if ipc_handles is not None:
+                    self.runtime.connect_ranks(remote_ranks, remote_mds, ipc_handles)
+                else:
+                    self.runtime.connect_ranks(remote_ranks, remote_mds)
+        else:
+            if ipc_handles is not None:
+                self.runtime.connect_ranks(remote_ranks, None, ipc_handles)
+            else:
+                self.runtime.connect_ranks(remote_ranks)
+
+    def disconnect_ranks(self, remote_ranks: List[int]) -> None:
+        """
+        Disconnect from remote ranks (NIXL mode).
+
+        Arguments:
+            remote_ranks: list of remote rank IDs to disconnect from.
+        """
+        assert _NIXL_MODE, "disconnect_ranks requires NIXL mode"
+        self.runtime.disconnect_ranks(remote_ranks)
+
+    def barrier(self) -> None:
+        """
+        Barrier across all active ranks (NIXL mode).
+        """
+        assert _NIXL_MODE, "barrier requires NIXL mode"
+        self.runtime.barrier()
